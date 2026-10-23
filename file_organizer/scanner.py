@@ -1,5 +1,6 @@
 from datetime import datetime
 from pathlib import Path
+from stat import S_ISREG
 
 
 def validate_folder(folder_text: str) -> Path:
@@ -25,11 +26,13 @@ def scan_folder(folder: Path) -> list:
             continue
 
         try:
-            # Ссылку проверяем до is_file(), который следует по ссылкам.
-            if entry.is_symlink() or not entry.is_file():
+            # Ссылки не обрабатываем; stat также не следует по ссылкам.
+            if entry.is_symlink():
                 continue
 
-            metadata = entry.stat()
+            metadata = entry.stat(follow_symlinks=False)
+            if not S_ISREG(metadata.st_mode):
+                continue
             modified_at = datetime.fromtimestamp(metadata.st_mtime)
             file_info = {
                 "name": entry.name,
