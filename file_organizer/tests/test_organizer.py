@@ -7,6 +7,8 @@ from unittest.mock import patch
 from contextlib import redirect_stdout
 
 import main
+import sorter
+from sorter import create_sort_plan, move_files
 from classifier import load_rules, classify_file, classify_files, count_by_category
 from report import build_report, build_statistics
 from scanner import scan_folder, validate_folder
@@ -168,7 +170,7 @@ class OrganizerTests(unittest.TestCase):
         before = file_path.stat().st_mtime_ns
         with patch.object(main, "scan_folder", wraps=scan_folder) as scanner:
             output = self.run_menu(
-                ["н", "2", "bad", "1", str(self.folder), "2", "3", "4"],
+                ["н", "2", "bad", "1", str(self.folder), "2", "3", "5"],
             )
         self.assertEqual(scanner.call_count, 1)
         self.assertIn("report.pdf -> Документы/", output)
@@ -179,7 +181,7 @@ class OrganizerTests(unittest.TestCase):
         report = load_report(self.report_path)
         self.assertEqual(report["rules"], self.rules)
         self.assertIn("classified_at", report)
-        self.assertIn("Предыдущий отчёт", self.run_menu(["д", "4"]))
+        self.assertIn("Предыдущий отчёт", self.run_menu(["д", "5"]))
 
     def test_menu_errors_preserve_previous(self):
         save_report(self.make_report(), self.report_path)
@@ -187,16 +189,16 @@ class OrganizerTests(unittest.TestCase):
         with patch.object(
             main, "scan_folder", side_effect=PermissionError("Нет доступа"),
         ):
-            self.run_menu(["н", "1", str(self.folder), "4"])
+            self.run_menu(["н", "1", str(self.folder), "5"])
         self.assertEqual(self.report_path.read_bytes(), previous)
         self.config_path.write_text("{", encoding="utf-8")
-        output = self.run_menu(["н", "1", "4"])
+        output = self.run_menu(["н", "1", "5"])
         self.assertIn("Ошибка JSON", output)
         self.assertEqual(self.report_path.read_bytes(), previous)
 
     def test_menu_reloads_rules_without_scan(self):
         (self.folder / "photo.JPG").touch()
-        answers = iter(["н", "1", str(self.folder), "2", "4"])
+        answers = iter(["н", "1", str(self.folder), "2", "5"])
 
         def answer(prompt):
             value = next(answers)
@@ -227,8 +229,180 @@ class OrganizerTests(unittest.TestCase):
         self.report_path.parent.mkdir()
         for text in ["{", "[]", "{}"]:
             self.report_path.write_text(text, encoding="utf-8")
-            output = self.run_menu(["д", "4"])
+            output = self.run_menu(["д", "5"])
             self.assertIn("Не удалось прочитать предыдущий отчёт", output)
+
+
+    def test_sort_pdf_and_rescan(self):
+        source = self.folder / "lecture.pdf"
+        source.write_bytes(b"pdf example")
+        (self.folder / "nested").mkdir()
+        (self.folder / "nested" / "inside.txt").touch()
+        (self.folder / ".hidden").touch()
+        (self.folder / "link.pdf").symlink_to("lecture.pdf")
+        files = scan_folder(self.folder)
+        plan = create_sort_plan(files, self.folder, self.rules)
+        self.assertFalse((self.folder / "Документы").exists())
+        result = move_files(plan)
+        self.assertEqual(result, {"moved": 1, "skipped": 0, "errors": 0})
+        self.assertFalse(source.exists())
+        self.assertEqual(
+            (self.folder / "Документы" / "lecture.pdf").read_bytes(), b"pdf example",
+        )
+        self.assertTrue((self.folder / "nested" / "inside.txt").exists())
+        self.assertTrue((self.folder / "link.pdf").is_symlink())
+        self.assertEqual(scan_folder(self.folder), [])
+
+    def test_sort_conflict_preserves_both_files(self):
+        source = self.folder / "lecture.pdf"
+        source.write_bytes(b"source")
+        target = self.folder / "Документы" / source.name
+        target.parent.mkdir()
+        target.write_bytes(b"existing")
+        plan = create_sort_plan(scan_folder(self.folder), self.folder, self.rules)
+        with redirect_stdout(io.StringIO()):
+            result = move_files(plan)
+        self.assertEqual(result["skipped"], 1)
+        self.assertEqual(source.read_bytes(), b"source")
+        self.assertEqual(target.read_bytes(), b"existing")
+
+    def test_sort_destination_created_during_move(self):
+        source = self.folder / "lecture.pdf"
+        source.write_bytes(b"source")
+        plan = create_sort_plan(scan_folder(self.folder), self.folder, self.rules)
+        original_link = sorter.link
+
+        def competing_link(source, destination, **kwargs):
+            destination.write_bytes(b"other process")
+            return original_link(source, destination, **kwargs)
+
+        with patch.object(sorter, "link", side_effect=competing_link):
+            with redirect_stdout(io.StringIO()):
+                result = move_files(plan)
+        self.assertEqual(result["skipped"], 1)
+        self.assertEqual(source.read_bytes(), b"source")
+        self.assertEqual(plan[0]["destination"].read_bytes(), b"other process")
+
+    def test_sort_changed_missing_and_replaced_sources(self):
+        for change in ("missing", "changed", "directory", "symlink"):
+            with self.subTest(change=change):
+                folder = self.folder / change
+                folder.mkdir()
+                source = folder / "lecture.pdf"
+                source.write_bytes(b"original")
+                plan = create_sort_plan(scan_folder(folder), folder, self.rules)
+                if change == "changed":
+                    source.write_bytes(b"modified")
+                else:
+                    source.unlink()
+                    if change == "directory":
+                        source.mkdir()
+                    elif change == "symlink":
+                        source.symlink_to(self.root / "missing")
+                with redirect_stdout(io.StringIO()) as output:
+                    result = move_files(plan)
+                self.assertEqual(result["skipped"], 1)
+                self.assertIn("Пропущено", output.getvalue())
+                self.assertFalse((folder / "Документы").exists())
+
+    def test_sort_unsafe_categories_and_blocked_folder(self):
+        source = self.folder / "lecture.pdf"
+        source.touch()
+        files = scan_folder(self.folder)
+        for category in ("../outside", "/absolute", ".", "a/b", "a\\b"):
+            with self.subTest(category=category):
+                with self.assertRaises(ValueError):
+                    create_sort_plan(files, self.folder, {category: [".pdf"]})
+        category_folder = self.folder / "Документы"
+        for blocker in ("file", "symlink"):
+            if blocker == "file":
+                category_folder.touch()
+            else:
+                category_folder.symlink_to(self.root, target_is_directory=True)
+            plan = create_sort_plan(files, self.folder, self.rules)
+            with redirect_stdout(io.StringIO()):
+                result = move_files(plan)
+            self.assertEqual(result["skipped"], 1)
+            self.assertTrue(source.exists())
+            category_folder.unlink()
+
+    def test_sort_unlink_error_keeps_both_names(self):
+        source = self.folder / "lecture.pdf"
+        source.write_bytes(b"source")
+        plan = create_sort_plan(scan_folder(self.folder), self.folder, self.rules)
+        with patch.object(Path, "unlink", side_effect=PermissionError("Нет доступа")):
+            with redirect_stdout(io.StringIO()):
+                result = move_files(plan)
+        self.assertEqual(result["errors"], 1)
+        self.assertEqual(source.read_bytes(), b"source")
+        self.assertEqual(plan[0]["destination"].read_bytes(), b"source")
+
+    def test_sort_access_error_continues(self):
+        for name in ("a.pdf", "b.pdf"):
+            (self.folder / name).touch()
+        plan = create_sort_plan(scan_folder(self.folder), self.folder, self.rules)
+        original_link = sorter.link
+
+        def failing_link(source, destination, **kwargs):
+            if source.name == "a.pdf":
+                raise PermissionError("Нет доступа")
+            return original_link(source, destination, **kwargs)
+
+        with patch.object(sorter, "link", side_effect=failing_link):
+            with redirect_stdout(io.StringIO()):
+                result = move_files(plan)
+        self.assertEqual(result, {"moved": 1, "skipped": 0, "errors": 1})
+        self.assertTrue((self.folder / "a.pdf").exists())
+
+    def test_menu_sort_cancel_changes_nothing(self):
+        source = self.folder / "lecture.pdf"
+        source.write_bytes(b"source")
+        for response in ("нет", "", "ДА", " да "):
+            saved_report = []
+            answers = iter(["н", "1", str(self.folder), "4", response, "5"])
+
+            def answer(prompt):
+                if prompt.startswith("Продолжить?"):
+                    saved_report.append(self.report_path.read_bytes())
+                return next(answers)
+
+            with patch.object(main, "move_files") as mover:
+                output = self.run_menu(answer)
+            mover.assert_not_called()
+            self.assertIn("Сортировка отменена", output)
+            self.assertEqual(list(self.folder.iterdir()), [source])
+            self.assertEqual(source.read_bytes(), b"source")
+            self.assertEqual(self.report_path.read_bytes(), saved_report[0])
+
+    def test_menu_sort_requires_fresh_scan(self):
+        source = self.folder / "lecture.pdf"
+        source.touch()
+        output = self.run_menu([
+            "н", "4", "1", str(self.folder), "4", "да", "4", "3", "5",
+        ])
+        self.assertIn("lecture.pdf -> Документы/lecture.pdf", output)
+        self.assertIn("Перемещено: 1", output)
+        self.assertIn("снимок до сортировки", output)
+        self.assertEqual(output.count("Сначала просканируйте папку"), 3)
+        self.assertEqual(load_report(self.report_path)["file_count"], 1)
+        self.run_menu(["н", "1", str(self.folder), "5"])
+        self.assertEqual(load_report(self.report_path)["file_count"], 0)
+
+    def test_menu_sort_invalid_config_does_not_move(self):
+        (self.folder / "lecture.pdf").touch()
+        answers = iter(["н", "1", str(self.folder), "4", "5"])
+
+        def answer(prompt):
+            value = next(answers)
+            if value == "4":
+                self.config_path.write_text("{", encoding="utf-8")
+            return value
+
+        with patch.object(main, "move_files") as mover:
+            output = self.run_menu(answer)
+        mover.assert_not_called()
+        self.assertIn("Не удалось подготовить сортировку", output)
+        self.assertTrue((self.folder / "lecture.pdf").exists())
 
 
 if __name__ == "__main__":

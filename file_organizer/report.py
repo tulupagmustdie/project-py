@@ -89,3 +89,12 @@ def build_report(folder, files: list, scanned_at: str, rules: dict) -> dict:
     }
     report.update(build_statistics(classified_files))
     return report
+
+
+def print_move_plan(plan: list):
+    """Показывает точные назначения перед подтверждением перемещения."""
+    print("\nПлан сортировки:\n")
+    for item in plan:
+        destination = item["destination"].relative_to(item["folder"])
+        print(f"{item['source'].name} -> {destination}")
+    print(f"Будет перемещено: {len(plan)} файлов")

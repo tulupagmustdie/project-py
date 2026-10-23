@@ -39,6 +39,10 @@ def scan_folder(folder: Path) -> list:
                 "extension": entry.suffix.lower() or "без расширения",
                 "size_bytes": metadata.st_size,
                 "modified_at": modified_at.isoformat(timespec="seconds"),
+                "mtime_ns": metadata.st_mtime_ns,
+                "ctime_ns": metadata.st_ctime_ns,
+                "device": metadata.st_dev,
+                "inode": metadata.st_ino,
             }
         except (OSError, ValueError, OverflowError) as error:
             print(f"Предупреждение: не удалось прочитать {entry.name}: {error}")
